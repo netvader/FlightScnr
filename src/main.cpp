@@ -346,6 +346,10 @@ bool adsbDnsReady(unsigned long now) {
     s_next_probe_ms = 0;
     return false;
   }
+  // A local feeder is reached by LAN name/IP, so adsb.fi's DNS must not gate polling.
+  if (services::adsb::adsbSourceMode() == services::adsb::AdsbSourceMode::LocalFeeder) {
+    return true;
+  }
   if (s_resolved) {
     return true;
   }

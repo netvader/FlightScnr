@@ -2,7 +2,12 @@
 
 #include <Arduino.h>
 #include <HTTPClient.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+
+#ifdef WM_MDNS
+#include <ESPmDNS.h>
+#endif
 
 #include <ArduinoJson.h>
 
@@ -74,9 +79,13 @@ void workerYield() { vTaskDelay(1); }
 // adsb.fi v3 records carry ~45 fields; we use ~10. A deserialization filter keeps
 // the JsonDocument to just those keys so a large response (many aircraft at long
 // range) can't balloon internal heap and starve the SPI display driver.
+//
+// The array lives under "ac" for adsb.fi and under "aircraft" for a raw readsb/
+// dump1090/tar1090 aircraft.json (e.g. a local ADSBExchange/FlightAware/PiAware
+// feeder on the LAN). Field names are otherwise identical (both are readsb-derived),
+// so one key list covers both; only the array's own key differs.
 void buildAircraftFilter(JsonDocument& filter) {
   filter["total"] = true;
-  JsonObject el = filter["ac"].add<JsonObject>();
   static const char* kKeepKeys[] = {
       "lat",          "lon",      "true_heading", "mag_heading", "track",
       "dir",          "gs",       "tas",          "ias",         "baro_rate",
@@ -84,8 +93,12 @@ void buildAircraftFilter(JsonDocument& filter) {
       "t",            "r",        "dbFlags",      "category",    "squawk",
       "orig_icao",    "origin_icao", "dep_icao",  "from",
       "dest_icao",    "destination_icao", "arr_icao", "to"};
-  for (const char* key : kKeepKeys) {
-    el[key] = true;
+  static const char* kArrayKeys[] = {"ac", "aircraft"};
+  for (const char* array_key : kArrayKeys) {
+    JsonObject el = filter[array_key].add<JsonObject>();
+    for (const char* key : kKeepKeys) {
+      el[key] = true;
+    }
   }
 }
 
@@ -355,6 +368,23 @@ constexpr char kPrefsAltFloorKey[] = "alt_floor_ft";
 constexpr char kPrefsAltFloorEnKey[] = "alt_fl_en";
 constexpr char kLegacyAltFloorKey[] = "minAltFt";
 constexpr char kPrefsAltCeilKey[] = "alt_ceil_ft";
+constexpr char kPrefsAdsbSourceModeKey[] = "adsb_src_mode";
+constexpr char kPrefsAdsbLocalUrlKey[] = "adsb_local_url";
+constexpr size_t kLocalFeedUrlMaxLen = 160;
+
+AdsbSourceMode s_adsb_source_mode = AdsbSourceMode::CloudAdsbFi;
+char s_local_feed_url[kLocalFeedUrlMaxLen] = "";
+
+// `.local` mDNS hostname resolution cache. This build's sdkconfig.defaults does not
+// set CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES, so plain WiFiClient::connect("x.local", ...)
+// never resolves via mDNS on its own -- an explicit query is required, and it is slow
+// enough (up to a few seconds) that it must be cached rather than repeated every poll.
+#ifdef WM_MDNS
+IPAddress s_local_feed_cached_ip;
+char s_local_feed_cached_host[64] = "";
+unsigned long s_local_feed_cached_ms = 0;
+constexpr unsigned long kLocalFeedMdnsTtlMs = 5UL * 60UL * 1000UL;
+#endif
 
 Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
@@ -817,6 +847,18 @@ void trafficFilterBootLoad() {
   if (s_altitude_ceiling_ft < 0) {
     s_altitude_ceiling_ft = 0;
   }
+
+  s_adsb_source_mode = prefs.getUChar(kPrefsAdsbSourceModeKey, 0) == 1
+                           ? AdsbSourceMode::LocalFeeder
+                           : AdsbSourceMode::CloudAdsbFi;
+  const String local_url = prefs.getString(kPrefsAdsbLocalUrlKey, "");
+  strncpy(s_local_feed_url, local_url.c_str(), sizeof(s_local_feed_url) - 1);
+  s_local_feed_url[sizeof(s_local_feed_url) - 1] = '\0';
+  if (s_adsb_source_mode == AdsbSourceMode::LocalFeeder && s_local_feed_url[0] == '\0') {
+    // No URL saved yet -- fall back rather than silently fail every poll.
+    s_adsb_source_mode = AdsbSourceMode::CloudAdsbFi;
+  }
+
   prefs.end();
 
   Serial.printf("Traffic altitude floor: %s (%d ft)\n",
@@ -825,6 +867,53 @@ void trafficFilterBootLoad() {
   if (s_altitude_ceiling_ft > 0) {
     Serial.printf("Traffic altitude ceiling: %d ft\n", s_altitude_ceiling_ft);
   }
+  Serial.printf("ADS-B source: %s%s%s\n",
+                s_adsb_source_mode == AdsbSourceMode::LocalFeeder ? "local feed" : "adsb.fi",
+                s_local_feed_url[0] != '\0' ? " " : "",
+                s_local_feed_url);
+}
+
+AdsbSourceMode adsbSourceMode() { return s_adsb_source_mode; }
+
+const char* localFeedUrl() { return s_local_feed_url; }
+
+void saveAdsbSourceFromForm(const char* mode_value, const char* url_value) {
+  const bool want_local = mode_value != nullptr && strcmp(mode_value, "local") == 0;
+  char sanitized_url[kLocalFeedUrlMaxLen] = "";
+  if (url_value != nullptr) {
+    // Trim surrounding whitespace the way a pasted URL commonly picks up.
+    while (*url_value == ' ' || *url_value == '\t') {
+      ++url_value;
+    }
+    size_t n = strnlen(url_value, sizeof(sanitized_url) - 1);
+    while (n > 0 && (url_value[n - 1] == ' ' || url_value[n - 1] == '\t' ||
+                     url_value[n - 1] == '\r' || url_value[n - 1] == '\n')) {
+      --n;
+    }
+    memcpy(sanitized_url, url_value, n);
+    sanitized_url[n] = '\0';
+  }
+
+  Preferences prefs;
+  if (prefs.begin(kPrefsNamespace, false)) {
+    prefs.putUChar(kPrefsAdsbSourceModeKey, want_local ? 1 : 0);
+    prefs.putString(kPrefsAdsbLocalUrlKey, sanitized_url);
+    prefs.end();
+  }
+
+  strncpy(s_local_feed_url, sanitized_url, sizeof(s_local_feed_url) - 1);
+  s_local_feed_url[sizeof(s_local_feed_url) - 1] = '\0';
+  s_adsb_source_mode =
+      (want_local && s_local_feed_url[0] != '\0') ? AdsbSourceMode::LocalFeeder
+                                                   : AdsbSourceMode::CloudAdsbFi;
+#ifdef WM_MDNS
+  // Force a fresh mDNS query on the next local fetch (host or IP may have changed).
+  s_local_feed_cached_ms = 0;
+#endif
+  Serial.printf("ADS-B source: %s%s%s\n",
+                s_adsb_source_mode == AdsbSourceMode::LocalFeeder ? "local feed" : "adsb.fi",
+                s_local_feed_url[0] != '\0' ? " " : "",
+                s_local_feed_url);
 }
 
 int altitudeFloorFt() { return s_altitude_floor_ft; }
@@ -894,8 +983,12 @@ float distSqFromCenterKm(double center_lat, double center_lon, float lat,
 
 bool parseAircraftDoc(JsonDocument& doc, Aircraft* out, size_t* out_count,
                       double center_lat, double center_lon, FetchStats* stats) {
+  // adsb.fi uses "ac"; a local readsb/tar1090 feeder's aircraft.json uses "aircraft".
   JsonArray ac = doc["ac"].as<JsonArray>();
   const int feed_total = doc["total"].is<int>() ? doc["total"].as<int>() : -1;
+  if (ac.isNull()) {
+    ac = doc["aircraft"].as<JsonArray>();
+  }
   if (ac.isNull()) {
     *out_count = 0;
     if (stats != nullptr) {
@@ -1049,6 +1142,69 @@ bool parseAircraftPayload(const char* payload, size_t payload_len, Aircraft* out
   return parseAircraftDoc(doc, out, out_count, center_lat, center_lon, &s_last_fetch_stats);
 }
 
+#ifdef WM_MDNS
+// `bare_host` excludes the ".local" suffix (ESPmDNS's queryHost convention).
+bool mdnsResolveHost(const String& bare_host, IPAddress* out_ip) {
+  const unsigned long now = millis();
+  if (s_local_feed_cached_ms != 0 &&
+      strcmp(s_local_feed_cached_host, bare_host.c_str()) == 0 &&
+      (now - s_local_feed_cached_ms) < kLocalFeedMdnsTtlMs) {
+    *out_ip = s_local_feed_cached_ip;
+    return true;
+  }
+  const IPAddress ip = MDNS.queryHost(bare_host, 3000);
+  if (ip == IPAddress(0, 0, 0, 0)) {
+    return false;
+  }
+  s_local_feed_cached_ip = ip;
+  strncpy(s_local_feed_cached_host, bare_host.c_str(), sizeof(s_local_feed_cached_host) - 1);
+  s_local_feed_cached_host[sizeof(s_local_feed_cached_host) - 1] = '\0';
+  s_local_feed_cached_ms = now;
+  *out_ip = ip;
+  return true;
+}
+#endif
+
+// Resolves a ".local" host in `url_in` to a dotted IP (via mDNS) and returns the
+// rewritten URL in `url_out`; any other host passes through unchanged. Local feeders
+// are commonly reached by mDNS name (e.g. adsbexchange.local), but this build does not
+// enable the sdkconfig option that would let the plain TCP stack resolve ".local"
+// itself, so it must be done explicitly before handing the URL to HTTPClient.
+bool resolveLocalFeedUrl(const String& url_in, String* url_out) {
+  *url_out = url_in;
+  const int scheme_end = url_in.indexOf("://");
+  if (scheme_end < 0) {
+    return true;
+  }
+  const int host_start = scheme_end + 3;
+  int host_end = url_in.length();
+  const int slash = url_in.indexOf('/', host_start);
+  const int colon = url_in.indexOf(':', host_start);
+  if (slash >= 0 && slash < host_end) {
+    host_end = slash;
+  }
+  if (colon >= 0 && colon < host_end) {
+    host_end = colon;
+  }
+  const String host = url_in.substring(host_start, host_end);
+  if (!host.endsWith(".local")) {
+    return true;
+  }
+#ifdef WM_MDNS
+  const String bare = host.substring(0, host.length() - 6);
+  IPAddress ip;
+  if (!mdnsResolveHost(bare, &ip)) {
+    Serial.printf("[adsb] mDNS resolve failed for %s\n", host.c_str());
+    return false;
+  }
+  *url_out = url_in.substring(0, host_start) + ip.toString() + url_in.substring(host_end);
+  return true;
+#else
+  Serial.println("[adsb] local feed host needs mDNS (WM_MDNS not built in)");
+  return false;
+#endif
+}
+
 bool fetchUpdateBlocking(double center_lat, double center_lon, float fetch_radius_km,
                        Aircraft* out, size_t* out_count) {
   const unsigned long fetch_start_ms = millis();
@@ -1062,14 +1218,26 @@ bool fetchUpdateBlocking(double center_lat, double center_lon, float fetch_radiu
     }
     return false;
   }
-  const float dist_nm = kmToNauticalMiles(fetch_radius_km);
+  const bool is_local = s_adsb_source_mode == AdsbSourceMode::LocalFeeder;
 
-  String url = kApiBase;
-  url += String(center_lat, 6);
-  url += "/lon/";
-  url += String(center_lon, 6);
-  url += "/dist/";
-  url += String(dist_nm, 1);
+  String url;
+  if (is_local) {
+    if (s_local_feed_url[0] == '\0') {
+      Serial.println("[adsb] local feed URL not set");
+      return false;
+    }
+    if (!resolveLocalFeedUrl(String(s_local_feed_url), &url)) {
+      return false;
+    }
+  } else {
+    const float dist_nm = kmToNauticalMiles(fetch_radius_km);
+    url = kApiBase;
+    url += String(center_lat, 6);
+    url += "/lon/";
+    url += String(center_lon, 6);
+    url += "/dist/";
+    url += String(dist_nm, 1);
+  }
 
   services::https::ScopedLock tls(kFetchHttpTimeoutMs + 2000);
   if (!tls.held()) {
@@ -1080,14 +1248,26 @@ bool fetchUpdateBlocking(double center_lat, double center_lon, float fetch_radiu
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  // WiFiClientSecure::setTimeout/setHandshakeTimeout take seconds, not milliseconds.
-  client.setTimeout(kFetchHttpTimeoutSec);
-  client.setHandshakeTimeout(kFetchHttpTimeoutSec);
+  // A local feeder is plain HTTP on the LAN; only the cloud source needs TLS. Both
+  // objects derive from WiFiClient, so HTTPClient (and readHttpPayload below) can
+  // keep using a single WiFiClient* regardless of which one is actually live.
+  const bool use_tls = !is_local || url.startsWith("https://");
+  WiFiClientSecure secure_client;
+  WiFiClient plain_client;
+  WiFiClient* client_ptr = nullptr;
+  if (use_tls) {
+    secure_client.setInsecure();
+    // WiFiClientSecure::setTimeout/setHandshakeTimeout take seconds, not milliseconds.
+    secure_client.setTimeout(kFetchHttpTimeoutSec);
+    secure_client.setHandshakeTimeout(kFetchHttpTimeoutSec);
+    client_ptr = &secure_client;
+  } else {
+    plain_client.setTimeout(kFetchHttpTimeoutSec);
+    client_ptr = &plain_client;
+  }
 
   HTTPClient http;
-  if (!http.begin(client, url)) {
+  if (!http.begin(*client_ptr, url)) {
     Serial.println("[adsb] http.begin failed");
     return false;
   }
@@ -1120,7 +1300,7 @@ bool fetchUpdateBlocking(double center_lat, double center_lon, float fetch_radiu
       }
     }
     http.end();
-    client.stop();
+    client_ptr->stop();
     services::https::drainTlsHeapAfterSession();
     return false;
   }
@@ -1131,12 +1311,12 @@ bool fetchUpdateBlocking(double center_lat, double center_lon, float fetch_radiu
                   http.getSize() < 0 ? 1 : 0,
                   static_cast<unsigned>(payload.len));
     http.end();
-    client.stop();
+    client_ptr->stop();
     services::https::drainTlsHeapAfterSession();
     return false;
   }
   http.end();
-  client.stop();
+  client_ptr->stop();
 
   services::https::drainTlsHeapAfterSession();
   workerYield();

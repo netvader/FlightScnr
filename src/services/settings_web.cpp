@@ -542,6 +542,40 @@ void handleSettingsPage() {
 
   appendRaw(page, kSettingsPageCap, &used, "</div></details>");
 
+  // ---------- ADS-B data source ----------
+  {
+    const bool is_local = services::adsb::adsbSourceMode() ==
+                          services::adsb::AdsbSourceMode::LocalFeeder;
+    const int src_n = snprintf(
+        page + used, kSettingsPageCap - used,
+        "<details class=\"card\"><summary><span class=\"ico\">&#128225;</span>"
+        "ADS-B data source<span class=\"sum\">cloud or local feeder</span>"
+        "<span class=\"chev\">&#9656;</span></summary><div class=\"body\">"
+        "<label for=\"adsb_source\">Live traffic from</label>"
+        "<select id=\"adsb_source\" name=\"adsb_source\">"
+        "<option value=\"cloud\"%s>adsb.fi (cloud, default)</option>"
+        "<option value=\"local\"%s>Local feeder (readsb / dump1090 / tar1090)</option>"
+        "</select>"
+        "<label for=\"adsb_local_url\">Local feeder aircraft.json URL</label>"
+        "<input id=\"adsb_local_url\" name=\"adsb_local_url\" type=\"text\" "
+        "autocomplete=\"off\" placeholder=\"http://adsbexchange.local/tar1090/data/aircraft.json\" "
+        "value=\"%s\">"
+        "<p class=\"hint\">For an ADSBExchange/FlightAware/PiAware feeder image or a plain "
+        "readsb/dump1090-fa install on your LAN. Plain <b>http://</b>, not https. "
+        "Both a <b>hostname.local</b> (mDNS) and a bare IP work. Every aircraft your "
+        "receiver hears is fetched and shown; the on-device range/altitude filters still "
+        "apply. Route/airline lookups (below) still use the internet.</p>",
+        is_local ? "" : " selected", is_local ? " selected" : "",
+        services::adsb::localFeedUrl());
+    appendClamped(page, kSettingsPageCap, &used, src_n);
+    if (is_local && services::adsb::localFeedUrl()[0] == '\0') {
+      appendRaw(page, kSettingsPageCap, &used,
+                "<p class=\"hint\" style=\"color:#e88\">No URL saved yet -- falling back to "
+                "adsb.fi until one is set.</p>");
+    }
+    appendRaw(page, kSettingsPageCap, &used, "</div></details>");
+  }
+
   // ---------- Radar basemap (Carto / FAA VFR bake) ----------
   {
     char bm_status[192];
@@ -1500,6 +1534,8 @@ void handleSave() {
   services::apikeys::saveWeatherEnabledFromForm(s_server->arg("use_weather").c_str());
   services::apikeys::saveOpenMeteoEnabledFromForm(s_server->arg("use_openmeteo").c_str());
   services::apikeys::saveAdsbDbEnabledFromForm(s_server->arg("use_adsbdb").c_str());
+  services::adsb::saveAdsbSourceFromForm(s_server->arg("adsb_source").c_str(),
+                                         s_server->arg("adsb_local_url").c_str());
   services::weather::saveUnitsFromForm(s_server->arg("weather_units").c_str());
   ui::displayPrefsSaveClockWeatherTimeoutFromForm(s_server->arg("clock_timeout").c_str());
   ui::displayPrefsSaveHideBlipDetailsFromForm(s_server->arg("hide_blip_details").c_str());

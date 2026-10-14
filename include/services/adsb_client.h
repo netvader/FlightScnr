@@ -79,6 +79,20 @@ struct FetchStats {
 
 const FetchStats& lastFetchStats();
 
+/** Where live traffic comes from. LocalFeeder points at a readsb/dump1090/tar1090
+ *  style aircraft.json on your own network (e.g. an ADSBExchange/FlightAware feeder). */
+enum class AdsbSourceMode : uint8_t { CloudAdsbFi = 0, LocalFeeder = 1 };
+
+/** Currently selected ADS-B source. */
+AdsbSourceMode adsbSourceMode();
+
+/** Local feeder aircraft.json URL, e.g. "http://adsbexchange.local/tar1090/data/aircraft.json".
+ *  Empty when unset. Only read when adsbSourceMode() == LocalFeeder. */
+const char* localFeedUrl();
+
+/** Persist source mode + local feeder URL from the web settings form. */
+void saveAdsbSourceFromForm(const char* mode_value, const char* url_value);
+
 size_t aircraftCount();
 const Aircraft* aircraftList();
 

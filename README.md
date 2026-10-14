@@ -30,7 +30,7 @@ Join the [FlightScnr community on **Discord**](https://discord.gg/wjqgUjv8Re) fo
 
 ## Features
 
-- **Radar** - sweeping display with range rings (2–30 mi presets: 2, 3, 6, 8, 10, 20, 30; default 8), compass rose, optional sweep line, optional label hide (compass + scale), themed colors (Green default), km/mi/nm units, rim dots for out-of-range traffic. Live ADS-B via [adsb.fi](https://adsb.fi), ~2s refresh, up to 64 aircraft.
+- **Radar** - sweeping display with range rings (2–30 mi presets: 2, 3, 6, 8, 10, 20, 30; default 8), compass rose, optional sweep line, optional label hide (compass + scale), themed colors (Green default), km/mi/nm units, rim dots for out-of-range traffic. Live ADS-B via [adsb.fi](https://adsb.fi) (default) or your own **local feeder** (see below), ~2s refresh, up to 64 aircraft.
 - **Flight detail** - tap a blip or short-press the knob: callsign, airline logo/name, route, ICAO type, altitude, speed. Knob cycles visible aircraft. Optional route lookup (see [APIs](#optional-apis)).
 - **Clock & forecast** - swipe down from radar: NTP time, date, current weather, sunrise/sunset. Swipe right for a 3-day forecast (hi/lo, icons, rain %).
 - **Auto timezone** - Fetch Timezone + DST from your radar center ([timeapi.io](https://timeapi.io), no API key needed). Manual UTC offset on-device disables auto until re-enabled on the web portal.
@@ -125,6 +125,33 @@ The device also checks GitHub for a newer release **on every boot** and again af
 Builds auto-download [tar1090-db](https://github.com/wiedehopf/tar1090-db) and [Airports](https://github.com/mwgg/Airports) lookups. Wrong T-Encoder panel saved? Erase flash and re-detect, or override with `-D FLIGHTSCNR_PANEL_DXQ` / `-D FLIGHTSCNR_PANEL_TFD12` in `platformio.ini`.
 
 ## Optional APIs
+
+### Local ADS-B feeder (fork addition, not upstream)
+
+Instead of adsb.fi's cloud API, the radar can pull traffic straight from a readsb/
+dump1090-fa/tar1090 install on your own LAN - e.g. an ADSBExchange, FlightAware
+(PiAware), or FlightRadar24 feeder image, or a bare `readsb`/`dump1090-fa` box.
+
+On the web portal, open **ADS-B data source**, switch to **Local feeder**, and enter
+the feeder's `aircraft.json` URL, e.g.:
+
+```
+http://adsbexchange.local/tar1090/data/aircraft.json
+```
+
+Notes:
+
+- Use plain `http://`, not `https://` - local feeders are not TLS.
+- Both an mDNS hostname (`something.local`) and a bare IP work.
+- The feeder returns everything its receiver hears; the device's own range and
+  altitude floor/ceiling filters still apply on top.
+- Route/airline lookups (AirLabs, FlightAware, FR24, adsbdb) still call their
+  respective internet APIs regardless of this setting - a local feeder only replaces
+  the live position feed.
+- If the feeder is unreachable or the URL is empty, the device falls back to adsb.fi
+  until the local source is reachable again.
+
+This was requested and closed as a non-goal upstream (see [issue #10](https://github.com/yashmulgaonkar/FlightScnr/issues/10)); it lives here as a fork-only feature.
 
 ### Weather (Tomorrow.io)
 
